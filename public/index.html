@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>MineCraft Voice — Demo Fullstack</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#06121a;--panel:#071826;--accent:#7bd389;--muted:#95a3b2}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(180deg,var(--bg),#02101a);color:#e6eef6;font-family:VT323,monospace}
+.container{max-width:1100px;margin:24px auto;padding:18px}
+.header{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.brand{font-family:'Press Start 2P';color:var(--accent)}
+.controls{display:flex;gap:8px}
+.btn{background:var(--accent);color:#042218;padding:10px 12px;border:2px solid rgba(0,0,0,0.3);cursor:pointer;font-family:'Press Start 2P'}
+.input{padding:8px;border:2px solid rgba(255,255,255,0.03);background:transparent;color:inherit}
+.main{display:grid;grid-template-columns:260px 1fr;gap:12px;margin-top:18px}
+.sidebar{background:#07111a;padding:12px;border:2px solid rgba(255,255,255,0.02)}
+.room{display:flex;flex-direction:column;gap:8px}
+.room-list{display:flex;flex-direction:column;gap:8px}
+.room-card{padding:8px;background:linear-gradient(180deg,#081a20,#041018);display:flex;justify-content:space-between;align-items:center;border-radius:6px}
+.panel{background:linear-gradient(180deg,#041425,#02101a);padding:12px;border-radius:6px}
+.users{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px}
+.user{background:linear-gradient(180deg,#072024,#021218);padding:12px;border-radius:8px;text-align:center;position:relative}
+.avatar{width:72px;height:72px;border-radius:50%;margin:6px auto;background:linear-gradient(180deg,#123,#021);display:flex;align-items:center;justify-content:center}
+.name{margin-top:6px}
+.speaking{box-shadow:0 0 12px 3px rgba(123,211,137,0.18)}
+.footer{position:fixed;left:50%;transform:translateX(-50%);bottom:12px;background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;display:flex;gap:8px}
+.toast{position:fixed;top:16px;right:16px;background:#041612;padding:10px;border-radius:6px}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<div class="brand">MineCraft Voice — Render Demo</div>
+<div class="controls">
+<input id="roomInput" class="input" placeholder="room name" />
+<input id="nameInput" class="input" placeholder="your name" />
+<button id="createBtn" class="btn">Create / Join</button>
+</div>
+</div>
+
+
+<div class="main">
+<aside class="sidebar">
+<div class="room">
+<div><strong>Room:</strong> <span id="roomLabel">—</span></div>
+<div><strong>ID:</strong> <span id="myId">—</span></div>
+</div>
+<hr />
+<div><strong>Members</strong></div>
+<div id="memberList" class="room-list"></div>
+</aside>
+
+
+<section class="panel">
+<div style="display:flex;justify-content:space-between;align-items:center">
+<div><strong>Voice Room</strong></div>
+<div>
+<button id="startMic" class="btn">Start Mic</button>
+<button id="stopMic" class="btn">Stop Mic</button>
+</div>
+</div>
+
+
+<div style="margin-top:12px">
+<div class="users" id="usersGrid"></div>
+</div>
+</section>
+</div>
+</div>
+
+
+<div id="toastBox"></div>
+<div class="footer">
+<div id="micState">Mic: Off</div>
+<div>Volume: <input id="masterVol" type="range" min="0" max="100" value="80" /></div>
+</div>
+
+
+<script>
+// Frontend signaling + mesh WebRTC implementation
+const wsPath = '/ws';
+let ws;
+let myId = null;
+let room = null;
+let name = null;
+const peers = new Map(); // peerId -> { pc, audioEl }
+let localStream = null;
+let audioCtx, analyser, pcmData;
+
+
+function toast(msg, ttl=4000){ const el = document.createElement('div'); el.className='toast'; el.innerText = msg; document.getElementById('toastBox').appendChild(el); setTimeout(()=>el.remove(), ttl); }
+
+// =======================
+// WEBSOCKET SETUP
+// =======================
+function connectWS() {
+    ws = new WebSocket((location.origin.replace(/^http/, 'ws')) + wsPath);
+
+    ws.onopen = () => toast("Connected to server");
+
+    ws.onmessage = async (msg) => {
+        const data = JSON.parse(msg.data);
+
+        if (data.type === "welcome") {
+            myId = data.id;
+            document.getElementById("myId").innerText = myId;
+        }
+
+        if (data.type === "room-users") {
+            updateMemberList(data.users);
+        }
+
+        if (data.type === "signal" && data.from !== myId) {
+            await handleSignal(data.from, data.signal);
+        }
+    };
+
+    ws.onerror = () => toast("WS Error", 3000);
+    ws.onclose = () => {
+        toast("Disconnected. Reconnecting...");
+        setTimeout(connectWS, 2000);
+    };
+}
+connectWS();
+
+
+// =======================
+// JOIN / CREATE ROOM
+// =======================
+document.getElementById("createBtn").onclick = () => {
+    room = document.getElementById("roomInput").value.trim();
+    name = document.getElementById("nameInput").value.trim();
+
+    if (!room || !name) return toast("Isi room & name dulu!");
+
+    ws.send(JSON.stringify({
+        type: "join",
+        room,
+        name
+    }));
+
+    document.getElementById("roomLabel").innerText = room;
+};
+
+
+// =======================
+// MEMBER LIST UI
+// =======================
+function updateMemberList(users) {
+    const box = document.getElementById("memberList");
+    box.innerHTML = "";
+
+    users.forEach(u => {
+        const div = document.createElement("div");
+        div.className = "room-card";
+        div.innerHTML = `<span>${u.name}</span> <span>${u.id === myId ? "(You)" : ""}</span>`;
+        box.appendChild(div);
+
+        if (!peers.has(u.id) && u.id !== myId) {
+            createPeer(u.id);
+        }
+    });
+}
+
+
+// =======================
+// WEBRTC
+// =======================
+async function createPeer(peerId) {
+    const pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+
+    pc.onicecandidate = (e) => {
+        if (e.candidate) {
+            ws.send(JSON.stringify({
+                type: "signal",
+                to: peerId,
+                from: myId,
+                signal: { candidate: e.candidate }
+            }));
+        }
+    };
+
+    pc.ontrack = (e) => {
+        const audio = document.createElement("audio");
+        audio.srcObject = e.streams[0];
+        audio.autoplay = true;
+        audio.volume = document.getElementById("masterVol").value / 100;
+
+        peers.get(peerId).audioEl = audio;
+
+        renderUsers();
+    };
+
+    peers.set(peerId, { pc });
+
+    if (localStream) {
+        localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    }
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    ws.send(JSON.stringify({
+        type: "signal",
+        to: peerId,
+        from: myId,
+        signal: { offer }
+    }));
+}
+
+
+// =======================
+// HANDLE SIGNAL
+// =======================
+async function handleSignal(peerId, signal) {
+    if (!peers.has(peerId)) createPeer(peerId);
+    const pc = peers.get(peerId).pc;
+
+    if (signal.offer) {
+        await pc.setRemoteDescription(new RTCSessionDescription(signal.offer));
+        const ans = await pc.createAnswer();
+        await pc.setLocalDescription(ans);
+
+        ws.send(JSON.stringify({
+            type: "signal",
+            to: peerId,
+            from: myId,
+            signal: { answer: ans }
+        }));
+    }
+
+    if (signal.answer) {
+        await pc.setRemoteDescription(new RTCSessionDescription(signal.answer));
+    }
+
+    if (signal.candidate) {
+        try { await pc.addIceCandidate(signal.candidate); } catch {}
+    }
+}
+
+
+// =======================
+// MICROPHONE
+// =======================
+document.getElementById("startMic").onclick = async () => {
+    if (!localStream) {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+
+    localStream.getAudioTracks()[0].enabled = true;
+    document.getElementById("micState").innerText = "Mic: ON";
+
+    setupAnalyser();
+
+    peers.forEach(({ pc }) => {
+        localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    });
+
+    toast("Mic ON");
+};
+
+document.getElementById("stopMic").onclick = () => {
+    if (!localStream) return;
+    localStream.getAudioTracks()[0].enabled = false;
+    document.getElementById("micState").innerText = "Mic: OFF";
+    toast("Mic OFF");
+};
+
+
+// =======================
+// SPEAKING INDICATOR
+// =======================
+function setupAnalyser() {
+    audioCtx = new AudioContext();
+    const src = audioCtx.createMediaStreamSource(localStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    pcmData = new Uint8Array(analyser.frequencyBinCount);
+
+    src.connect(analyser);
+    loopSpeaking();
+}
+
+function loopSpeaking() {
+    requestAnimationFrame(loopSpeaking);
+    analyser.getByteFrequencyData(pcmData);
+
+    const volume = pcmData.reduce((a, b) => a + b) / pcmData.length;
+
+    const me = document.getElementById("user-" + myId);
+    if (me) {
+        if (volume > 35) me.classList.add("speaking");
+        else me.classList.remove("speaking");
+    }
+}
+
+// =======================
+// RENDER USER GRID
+// =======================
+function renderUsers() {
+    const grid = document.getElementById("usersGrid");
+    grid.innerHTML = "";
+
+    peers.forEach((v, id) => {
+        const el = document.createElement("div");
+        el.className = "user";
+        el.id = "user-" + id;
+        el.innerHTML = `
+            <div class="avatar">👤</div>
+            <div class="name">${id}</div>
+        `;
+        grid.appendChild(el);
+    });
+}
+
+
+// =======================
+// MASTER VOLUME
+// =======================
+document.getElementById("masterVol").oninput = (e) => {
+    const vol = e.target.value / 100;
+    peers.forEach(p => {
+        if (p.audioEl) p.audioEl.volume = vol;
+    });
+};
+
+// =======================
+// HELPER: TOAST NOTIFIKASI
+// =======================
+function toast(msg, ttl = 4000) {
+    const box = document.getElementById("toastBox");
+    const el = document.createElement("div");
+    el.className = "toast";
+    el.innerText = msg;
+    box.appendChild(el);
+    setTimeout(() => el.remove(), ttl);
+}
+
+
+// =======================
+// RE-RENDER USERS SAAT PEER MASUK
+// (dipanggil dari updateMemberList juga)
+// =======================
+setInterval(() => {
+    renderUsers();
+}, 1500);
+
+</script>
+
+</body>
+</html>
